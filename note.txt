@@ -1,0 +1,329 @@
+Below is a copy‑paste presentation script you can read word‑for‑word. It’s organized so you can stop after any section, answer questions, then continue. I focus on database design, security, triggers, tokens, SQL‑injection prevention, duplicate prevention, and the key backend flows that tie it all together.
+
+Title: CATMS – Clinical Appointment and Treatment Management System
+
+1) Elevator pitch and scope
+- Today I’ll present our hospital management system, CATMS. It centralizes patients, appointments, treatments, billing, notifications, and audit trails.
+- My priorities in this talk are: database design and constraints, security controls, database triggers, token auth, SQL‑injection prevention, duplicate prevention, and the backend architecture that enforces all of this.
+
+2) High‑level architecture
+- Frontend: React + TypeScript (admin and patient portals).
+- Backend: Node.js + Express, Sequelize ORM for MySQL, with some raw SQL where performance or precision is needed.
+- Database: MySQL. The schema is normalized, uses foreign keys for referential integrity, unique constraints for duplicates, and triggers for cross‑row validations and auditing.
+- Background jobs: cron tasks for appointment and payment reminders.
+- Email/SMS via providers. If credentials aren’t present, those services are disabled safely.
+
+3) Core database schema overview
+- patients: Demographics and login for patient portal (email unique, national_id unique, active boolean, password_hash).
+- users or staff: Staff and admins for the admin portal. Role‑based access control via roles table. Login credentials stored as password_hash.
+- roles: Canonical role names such as “System Administrator”, “Doctor”, “Receptionist”, etc.
+- appointments: Links patient and doctor, branch, datetime, status, reason, created/approved metadata.
+- treatment_catalogue: Master list of treatments (name, description, ICD‑10, CPT, standard_cost, category, is_active).
+- treatment_records: Clinical notes/prescriptions captured per appointment.
+- invoices: Billing totals, due date, status; linked to patient and appointment.
+- payments: Linked to invoice, amount, method, transaction_id, timestamp.
+- insurance_claims: Links invoice to claim, status and timestamps.
+- branches: Branch metadata.
+- audit_log: Who did what, to which table and record, when, and from which IP.
+
+Key constraints and indexes:
+- UNIQUE constraints: patients.email, patients.national_id; staff/users.email; payments.transaction_id (if provided); optionally a composite on appointments(doctor_id, appointment_date) if your appointment slots are aligned.
+- FOREIGN KEYs: appointments.patient_id → patients.patient_id; appointments.doctor_id → users.user_id (or staff.staff_id if you use staff for doctors); invoices.patient_id → patients; payments.invoice_id → invoices; insurance_claims.invoice_id → invoices.
+- Indexes: frequent filters like appointments(doctor_id, appointment_date), invoices(patient_id, created_at), payments(invoice_id), audit_log(timestamp, user_id).
+
+4) Security model and hardening
+- Passwords: bcrypt hashed with per‑user salt. No plaintext. Password resets generate new hashes.
+- Tokens: JWT for both admin/staff and patients.
+  - Payload includes the subject id, email, role/type, and minimal PII.
+  - Short expiration recommended (e.g., 15–30 minutes) and refresh tokens if you need long sessions.
+  - Stored and transmitted in the Authorization header (Bearer token). HTTPS is required in production.
+- Authorization: Role‑based middleware. All admin routes call authenticateToken then authorizeRoles(...) so only allowed roles hit each controller.
+- Input validation: On the backend we validate and coerce types:
+  - Numeric fields are converted server‑side; invalid values return 400.
+  - Required fields are enforced with explicit checks. We fail early and respond with a useful error message.
+- SQL injection prevention:
+  - Sequelize model methods are parameterized by design.
+  - For raw queries we ALWAYS use parameter binding or “replacements.” We never interpolate user input into SQL strings.
+  - Example pattern we use:
+    - await db.query('UPDATE appointments SET status = :status WHERE appointment_id = :id', { replacements: { status, id }, type: QueryTypes.UPDATE });
+- Least‑privilege DB user:
+  - The application connects as a dedicated MySQL user with only the privileges it needs. No root credentials in production.
+- Secrets and configuration:
+  - Loaded via dotenv; secrets are never committed. Missing provider credentials degrade features safely (email/SMS disabled).
+- Transport security and headers:
+  - In production, run behind HTTPS and enable secure headers (e.g., Helmet) and CORS rules for your allowed origins.
+- Rate limiting and logging:
+  - Add rate limiting on auth routes and other sensitive endpoints.
+  - Centralized request logging helps detect anomalies.
+- Auditing:
+  - Every sensitive write creates an audit trail entry (who, what, where, when). We do this at the backend service layer and optionally reinforce with DB triggers.
+
+5) Duplicate prevention (multi‑layer)
+- Database constraints:
+  - UNIQUE(patients.email), UNIQUE(patients.national_id), UNIQUE(users.email), and optionally UNIQUE(payments.transaction_id).
+  - For appointments you can enforce UNIQUE(doctor_id, appointment_date) if your slots are discrete (e.g., every 15–30 min).
+- Triggers for flexible duplicate logic:
+  - If you allow “Pending” to be rescheduled, a pure UNIQUE might be too strict. The trigger approach can check for “overlapping slots that are not Cancelled/Rejected” and block only those.
+- Application‑layer checks:
+  - Before INSERT/UPDATE we check the DB for conflicts and return 400 with a human‑readable message. This reduces round‑trip errors from unique constraints and gives better UX.
+
+6) Business rules and data integrity with MySQL triggers
+- We combine application checks with DB triggers to guarantee integrity even if a different client bypasses the app.
+
+Here are production‑ready examples you can execute (adjust table/column names to your schema).
+
+A) Prevent overlapping appointments for a doctor (30‑minute slots)
+
+```sql
+DELIMITER $$
+
+CREATE TRIGGER trg_appointments_prevent_overlap
+BEFORE INSERT ON appointments
+FOR EACH ROW
+BEGIN
+  -- Prevent bookings with NULL doctor_id or datetime
+  IF NEW.doctor_id IS NULL OR NEW.appointment_date IS NULL THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Doctor and appointment_date are required';
+  END IF;
+
+  -- Block overlapping non-cancelled/non-rejected appointments in a 30-min window
+  IF EXISTS (
+    SELECT 1
+    FROM appointments a
+    WHERE a.doctor_id = NEW.doctor_id
+      AND a.status NOT IN ('Cancelled', 'Rejected')
+      AND ABS(TIMESTAMPDIFF(MINUTE, a.appointment_date, NEW.appointment_date)) < 30
+  ) THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Time slot is already booked for this doctor';
+  END IF;
+END$$
+
+DELIMITER ;
+```
+
+Repeat the same logic for updates:
+
+```sql
+DELIMITER $$
+
+CREATE TRIGGER trg_appointments_prevent_overlap_upd
+BEFORE UPDATE ON appointments
+FOR EACH ROW
+BEGIN
+  IF NEW.doctor_id IS NULL OR NEW.appointment_date IS NULL THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Doctor and appointment_date are required';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+    FROM appointments a
+    WHERE a.doctor_id = NEW.doctor_id
+      AND a.appointment_id <> OLD.appointment_id
+      AND a.status NOT IN ('Cancelled', 'Rejected')
+      AND ABS(TIMESTAMPDIFF(MINUTE, a.appointment_date, NEW.appointment_date)) < 30
+  ) THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Time slot is already booked for this doctor';
+  END IF;
+END$$
+
+DELIMITER ;
+```
+
+B) Keep invoice totals consistent (no over‑payments)
+
+```sql
+DELIMITER $$
+
+CREATE TRIGGER trg_payments_no_overpay
+BEFORE INSERT ON payments
+FOR EACH ROW
+BEGIN
+  DECLARE v_total DECIMAL(10,2);
+  DECLARE v_paid  DECIMAL(10,2);
+
+  SELECT total_amount, paid_amount INTO v_total, v_paid
+  FROM invoices
+  WHERE invoice_id = NEW.invoice_id
+  FOR UPDATE;
+
+  IF v_total IS NULL THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Invoice not found';
+  END IF;
+
+  IF NEW.amount <= 0 THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Payment amount must be positive';
+  END IF;
+
+  IF v_paid + NEW.amount > v_total THEN
+    SIGNAL SQLSTATE '45000'
+      SET MESSAGE_TEXT = 'Payment exceeds invoice total';
+  END IF;
+END$$
+
+DELIMITER ;
+```
+
+Optionally, auto‑update invoice status after payment:
+
+```sql
+DELIMITER $$
+
+CREATE TRIGGER trg_payments_update_invoice
+AFTER INSERT ON payments
+FOR EACH ROW
+BEGIN
+  UPDATE invoices
+  SET paid_amount = paid_amount + NEW.amount,
+      status = CASE
+                 WHEN paid_amount + NEW.amount >= total_amount THEN 'Paid'
+                 WHEN paid_amount + NEW.amount = 0 THEN 'Pending'
+                 ELSE 'Partially Paid'
+               END
+  WHERE invoice_id = NEW.invoice_id;
+END$$
+
+DELIMITER ;
+```
+
+C) Normalize emails to lowercase (patients and staff)
+
+```sql
+DELIMITER $$
+
+CREATE TRIGGER trg_patients_lower_email
+BEFORE INSERT ON patients
+FOR EACH ROW
+BEGIN
+  IF NEW.email IS NOT NULL THEN
+    SET NEW.email = LOWER(NEW.email);
+  END IF;
+END$$
+
+CREATE TRIGGER trg_patients_lower_email_upd
+BEFORE UPDATE ON patients
+FOR EACH ROW
+BEGIN
+  IF NEW.email IS NOT NULL THEN
+    SET NEW.email = LOWER(NEW.email);
+  END IF;
+END$$
+
+DELIMITER ;
+```
+
+D) Table‑level auditing (optional, DB‑side)
+- We primarily log audit events in the backend (who, action, table, id, IP).
+- If you want a DB‑side safety net, use AFTER triggers to insert minimal info into audit_log when rows change. You won’t have the IP or app user_id unless you pass session context, so we keep DB‑side auditing as a fallback, not the primary source.
+
+7) Token flow and RBAC (backend)
+- Authentication:
+  - Patient routes use authenticatePatient middleware. It verifies the JWT, attaches the patient to req.user (and we also support older code that reads req.patient).
+  - Admin/staff routes use authenticateToken to verify staff JWTs.
+- Authorization:
+  - After auth, we compose authorizeRoles('System Administrator', 'Doctor', ...) to enforce role‑based access per route group.
+- Password changes and profile edits:
+  - Only the authenticated patient can modify their own profile and password.
+  - Sensitive fields like email and national_id are blocked from patient‑side edits. Staff can update them via admin flows if allowed.
+- Example middleware stack on a secure route:
+  - router.use(authenticateToken)
+  - router.get('/', authorizeRoles('System Administrator', 'Branch Manager'), handler)
+
+8) SQL‑injection prevention in practice
+- Rule 1: Do not build SQL with string concatenation.
+- Rule 2: Use Sequelize model methods or raw queries with bound parameters.
+- Real example we use for updates:
+  - await db.query('UPDATE appointments SET status = :status WHERE appointment_id = :id', { replacements: { status, id }, type: QueryTypes.UPDATE });
+- Our controllers that accept numbers convert strings to numbers server‑side and validate bounds before hitting the database.
+
+9) Timezone and datetime policy
+- Datetime bugs are common. We picked a consistent policy:
+  - When the UI uses a datetime‑local input, it sends “YYYY‑MM‑DD HH:MM:SS” in local clinic time to the API.
+  - The API stores exactly that string in a DATETIME column (no timezone conversion), so what you select is what you see.
+  - For global deployments, switch to storing UTC and convert at the edges consistently. Just don’t mix policies.
+
+10) Backend reliability patterns
+- Transactions:
+  - When we perform multi‑step operations (e.g., create invoice + first payment + audit), we use transactions so either all steps commit or none do.
+- Idempotency:
+  - For payments, transaction_id can be unique to prevent duplicate posts if the client retries.
+- Error handling:
+  - Central error handlers convert internal exceptions into predictable JSON payloads with meaningful messages and HTTP status codes.
+- Background jobs:
+  - Cron tasks for appointment reminders and payment reminders are scheduled and log their execution.
+- Observability:
+  - Console logs for dev, structured logging in prod. Audit logs capture user actions (who, what, when, where).
+
+11) Demo script (what I click and why)
+- Log in as System Administrator. Show role‑based menus.
+- Open Audit Logs. Explain that the table lists rows from audit_log. If any query error happens, we pin selected columns so Sequelize never fetches non‑existent fields.
+- Go to Staff:
+  - Create a staff member with password (hash stored).
+  - Toggle active/inactive with the dedicated button (soft status change).
+  - Use the trash icon to hard‑delete a staff member (removes staff and linked login).
+- Treatments:
+  - “Add Treatment” opens a dialog backed by the treatment_catalogue table (not the clinical treatment_records).
+  - Create one with name, cost, codes; show it appears in the catalogue. Deactivate to hide rather than delete.
+- Appointments:
+  - Create or edit an appointment. If I reschedule into an occupied doctor slot, the BEFORE trigger blocks it with a clear message.
+  - As a doctor, I can now edit, cancel, and change status, aligned with our role policy.
+- Billing:
+  - Create an invoice; add a payment. The BEFORE trigger prevents over‑payments; the AFTER trigger updates invoice status automatically.
+- Patient portal:
+  - Log in as a patient; open My Profile; edit phone/address; save. The controller now reads req.user or req.patient consistently, so updates persist.
+  - Change password and confirm bcrypt hashing in DB.
+
+12) Operational hardening and deployment
+- .env secrets: JWT secret, DB credentials, mail/SMS keys. In prod these come from your secret manager.
+- Least‑privilege DB and network ACLs: Only the app can reach the DB, and only over a private network/VPC.
+- Backups: Daily snapshots and PITR (point‑in‑time recovery) if your MySQL edition supports binlogs.
+- Migrations: Keep DDL in version control; apply using a migration tool or SQL change scripts; test trigger logic in staging first.
+- Monitoring: Track 5xx rates, failed logins, slow queries, and audit volume.
+
+13) Why this matters
+- By enforcing constraints at the database layer, we eliminate whole classes of data corruption.
+- By using parameterized queries and hashed passwords, we neutralize common attack vectors.
+- By instrumenting audit logs and background reminders, we improve traceability and patient engagement, ultimately reducing no‑shows and billing errors.
+
+14) Q&A anchors
+- If asked about GDPR/PHI: Sensitive data is minimized in logs; access is RBAC‑controlled; encryption in transit is enforced; encryption at rest is recommended at the DB or disk level.
+- If asked about scaling: Add read replicas for analytics and audit exports; partition audit_log by time if it grows large; cache hot reads.
+- If asked about vendor lock‑in: The model uses standard MySQL features; Sequelize abstracts most queries; raw SQL is limited and portable.
+
+Appendix – handy SQL you can run during a demo
+- Show patients with unique constraints:
+
+```sql
+SHOW CREATE TABLE patients;
+SELECT email, national_id, active FROM patients LIMIT 5;
+```
+
+- Confirm audit_log shape (no staff_id):
+
+```sql
+SHOW COLUMNS FROM audit_log;
+SELECT log_id, user_id, action, target_table, target_id, timestamp FROM audit_log ORDER BY timestamp DESC LIMIT 10;
+```
+
+- Exercise the appointment overlap trigger (should fail if slot is taken):
+
+```sql
+INSERT INTO appointments (patient_id, doctor_id, appointment_date, status)
+VALUES (1, 2, '2025-10-25 16:20:00', 'Scheduled'); -- Expect success only if slot is free
+```
+
+- Test payment over‑pay prevention:
+
+```sql
+INSERT INTO payments (invoice_id, amount, method) VALUES (123, 999999, 'Cash'); -- Expect failure if exceeds total
+```
+
+Wrap‑up
+- CATMS is secure by default, audited by design, and uses the database as the source of truth for integrity. The backend enforces roles and validation, while the database guarantees that even if a client misbehaves, our data stays consistent.
+
+That concludes my presentation. I’m happy to dive into any component—schema, triggers, tokens, or the backend controllers.
