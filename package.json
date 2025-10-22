@@ -1,15 +1,5 @@
 {
-  "name": "group_project_db",
-  "private": true,
-  "workspaces": [
-    "backend",
-    "frontend"
-  ],
-  "scripts": {
-    "postinstall": "npm --prefix backend ci && npm --prefix backend run build",
-    "start": "npm --prefix backend run start"
-  },
-  "engines": {
-    "node": ">=20"
+  "dependencies": {
+    "mysql2": "^3.15.0"
   }
 }

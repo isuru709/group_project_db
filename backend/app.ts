@@ -11,7 +11,15 @@ dotenv.config();
 
 const app = express();
 app.use(cors({ 
-  origin: ['http://localhost:5173', 'http://localhost:3000', 'http://127.0.0.1:5173', 'http://127.0.0.1:3000'], 
+  origin: [
+    'http://localhost:5173', 
+    'http://localhost:3000', 
+    'http://127.0.0.1:5173', 
+    'http://127.0.0.1:3000',
+    'http://34.124.230.151:5173',  // Add VM frontend
+    'http://34.124.230.151:3000',   // Add alternative port
+    'http://34.124.230.151'          // Add root domain
+  ], 
   credentials: true 
 }));
 app.use(helmet());

@@ -1,12 +1,15 @@
 import axios from 'axios';
 
-const DEBUG = false; // set true for local verbose logging
+const DEBUG = false;
 
-axios.defaults.baseURL = 'http://localhost:5000'; // Your backend URL
+// Use environment variable or fallback to VM IP
+const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://34.124.230.151:5000';
+
+axios.defaults.baseURL = API_BASE_URL;
 
 // Create a separate axios instance for profile picture uploads
 const profileUploadApi = axios.create({
-  baseURL: 'http://localhost:5000', // Profile picture upload service
+  baseURL: API_BASE_URL, // Profile picture upload service
   withCredentials: true
 });
 axios.defaults.withCredentials = true;
